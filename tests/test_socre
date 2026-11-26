@@ -1,0 +1,177 @@
+import sys
+import os
+from pathlib import Path
+import cv2
+import numpy as np
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import src.score as score
+
+# 输出目录：test_output，自动创建
+OUTPUT_DIR = Path(__file__).resolve().parents[1] / "test_output"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+@pytest.fixture
+def test_image(tmp_path):
+    image = np.random.randint(0, 256, (300, 400, 3), dtype=np.uint8)
+    path = tmp_path / "test.jpg"
+    success, encoded = cv2.imencode(".jpg", image)
+    assert success
+    path.write_bytes(encoded.tobytes())
+    return path
+
+def read_test_image(path):
+    data = np.fromfile(str(path), dtype=np.uint8)
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+def test_sharpness_score(test_image):
+    image = read_test_image(test_image)
+    raw, result = score.calculate_sharpness(image)
+    assert raw >= 0
+    assert 0 <= result <= 100
+
+def test_exposure_score(test_image):
+    image = read_test_image(test_image)
+    raw, result = score.calculate_exposure(image)
+    assert "mean_brightness" in raw
+    assert "dark_ratio" in raw
+    assert "bright_ratio" in raw
+    assert 0 <= result <= 100
+
+def test_color_score(test_image):
+    image = read_test_image(test_image)
+    raw, result = score.calculate_color(image)
+    assert 0 <= raw <= 1
+    assert 0 <= result <= 100
+
+def test_total_score_full_dim():
+    scores = {
+        "sharpness": 80,
+        "exposure": 90,
+        "color": 70,
+        "aesthetic": 85,
+        "composition": 75
+    }
+    total, eff_w = score.calculate_total_score(scores)
+    assert total == pytest.approx(80.50)
+
+def test_total_score_missing_aesthetic():
+    scores = {
+        "sharpness": 80,
+        "exposure": 90,
+        "color": 70,
+        "aesthetic": None,
+        "composition": 75
+    }
+    total, eff_w = score.calculate_total_score(scores)
+    assert total == pytest.approx(79.375)
+    assert eff_w["aesthetic"] == 0.0
+
+def test_total_score_all_none():
+    scores = {
+        "sharpness": None,
+        "exposure": None,
+        "color": None,
+        "aesthetic": None,
+        "composition": None
+    }
+    total, _ = score.calculate_total_score(scores)
+    assert total is None
+
+def test_nima_failure(monkeypatch):
+    def fake_load():
+        raise RuntimeError("模拟NIMA加载失败")
+    monkeypatch.setattr(score, "load_nima_model", fake_load)
+    raw, result = score.calculate_aesthetic("fake.jpg")
+    assert raw is None
+    assert result is None
+
+def test_score_image_missing_file():
+    res = score.score_image("not_exist_image.jpg")
+    assert res["status"] == "error"
+
+def test_invalid_image(tmp_path):
+    invalid_path = tmp_path / "bad.jpg"
+    invalid_path.write_bytes(b"this is not image bytes")
+    res = score.score_image(str(invalid_path))
+    assert res["status"] in ("error","partial")
+
+def test_score_image_normal_case(test_image, monkeypatch):
+    def fake_aesthetic(path):
+        return 7.5, 72.22
+    monkeypatch.setattr(score, "calculate_aesthetic", fake_aesthetic)
+
+    comp_info = {"subject_coverage":0.8, "saliency_retention":0.75}
+    result = score.score_image(
+        str(test_image),
+        image_id="test01",
+        composition_info=comp_info
+    )
+    assert result["schema_version"] == "1.0"
+    data = result["data"]
+    assert data is not None
+    assert data["image_id"] == "test01"
+    assert 0 <= data["sharpness_score"] <= 100
+    assert 0 <= data["exposure_score"] <=100
+    assert 0 <= data["color_score"] <=100
+    assert data["aesthetic_score"] == pytest.approx(72.22)
+    assert data["total_score"] is not None
+    assert set(data["raw_scores"].keys()) == {"sharpness","exposure","color","aesthetic","composition"}
+
+
+def run_testA_scoring():
+    """
+    业务测试：读取根目录testA下A01~A20子文件夹内所有图片
+    testA与src平级，每个子目录存放一组照片
+    输出评分结果到 test_output/score_testA_result.json
+    注意：缺少crop模块输入，composition_score为null，status=partial属于正常
+    """
+    import json
+    print("\n===== 开始处理 testA 数据集真实图片 =====")
+
+    # testA 在项目根目录，和src平级
+    testA_root = Path(__file__).resolve().parents[1] / "testA"
+    output_file = OUTPUT_DIR / "score_testA_result.json"
+    out_records = []
+
+    if not testA_root.exists():
+        print(f"错误：testA目录不存在 {testA_root}")
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(out_records, f, ensure_ascii=False, indent=2)
+        return
+
+    # 遍历A01,A02 ... A20子文件夹
+    sub_dirs = sorted([d for d in testA_root.glob("A*") if d.is_dir()])
+    print(f"发现子目录数量：{len(sub_dirs)}")
+
+    for subdir in sub_dirs:
+        print(f"\n>> 处理组别：{subdir.name}")
+        # 子目录下找图片：jpg jpeg png
+        img_paths = list(subdir.glob("*.jpg")) + list(subdir.glob("*.jpeg")) + list(subdir.glob("*.png"))
+        img_paths = sorted(img_paths)
+        if len(img_paths) == 0:
+            print(f"组别 {subdir.name} 未找到图片，跳过")
+            continue
+
+        for img_p in img_paths:
+            print(f"  处理：{img_p.name}")
+            # 传入相对项目根目录的字符串路径
+            rel_path = str(img_p.relative_to(Path(__file__).resolve().parents[1]))
+            ret = score.score_image(rel_path, image_id=f"{subdir.name}_{img_p.stem}")
+            # 额外记录组别信息方便看报告
+            ret["group_tag"] = subdir.name
+            out_records.append(ret)
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(out_records, f, ensure_ascii=False, indent=2)
+    print(f"\ntestA全部图片评分完成，共处理 {len(out_records)} 张图片")
+    print(f"结果保存：{output_file}")
+
+
+
+if __name__ == "__main__":
+    # 1.执行pytest单元测试
+    pytest.main([__file__, "-v"])
+    # 2.执行testA真实图片打分
+    run_testA_scoring()
