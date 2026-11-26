@@ -1,0 +1,467 @@
+import os
+import time
+import cv2
+import numpy as np
+import torch
+import pyiqa
+from pathlib import Path
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+# 默认五维权重，正式运行以config传入的score.weights为准
+WEIGHTS = {
+    "sharpness": 0.25,
+    "exposure": 0.20,
+    "color": 0.15,
+    "aesthetic": 0.20,
+    "composition": 0.20
+}
+NIMA_MODEL = "nima"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+NORMALIZATION_ID = "score_norm_v1"
+SCORING_PROFILE_ID = "score_profile_v1"
+nima_model = None
+
+def make_result(status, reason, data=None, errors=None):
+    return {
+        "schema_version": "1.0",
+        "status": status,
+        "reason": reason,
+        "errors": errors or [],
+        "data": data
+    }
+
+def make_error(code, message, context=None, retryable=False):
+    return {
+        "code": code,
+        "module": "score",
+        "message": message,
+        "retryable": retryable,
+        "context": context or {}
+    }
+
+def load_nima_model():
+    global nima_model
+    if nima_model is None:
+        nima_model = pyiqa.create_metric(
+            NIMA_MODEL,
+            device=DEVICE
+        )
+        params = sum(
+            p.numel() for p in nima_model.parameters()
+        )
+        print(
+            f"NIMA模型加载成功，参数量：{params / 1e6:.2f}M，"
+            f"运行设备：{DEVICE}"
+        )
+    return nima_model
+
+def calculate_sharpness(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    raw_score = float(laplacian.var())
+    # 注意：当前归一化缩放系数8.0硬编码；后续版本应从config读取L/U上下界
+    # normalization_id:score_norm_v1记录该套归一化映射
+    score = min(100.0, raw_score / 8.0)
+    return raw_score, float(score)
+
+def calculate_exposure(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    mean_brightness = float(np.mean(gray))
+    dark_ratio = float(np.mean(gray < 30))
+    bright_ratio = float(np.mean(gray > 245))
+    brightness_score = max(
+        0.0,
+        100.0 - abs(mean_brightness - 127.5) / 127.5 * 100
+    )
+    clipping_ratio = dark_ratio + bright_ratio
+    clipping_score = max(
+        0.0,
+        100.0 - clipping_ratio * 250
+    )
+    exposure_score = (
+        brightness_score * 0.5 +
+        clipping_score * 0.5
+    )
+    # 注意：明暗阈值、截断惩罚系数为硬编码；后续版本迁移至配置
+    raw = {
+        "mean_brightness": mean_brightness,
+        "dark_ratio": dark_ratio,
+        "bright_ratio": bright_ratio
+    }
+    return raw, float(exposure_score)
+
+def calculate_color(image):
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    saturation = hsv[:, :, 1] / 255.0
+    mean_saturation = float(np.mean(saturation))
+    # 注意：目标饱和度0.4硬编码；后续版本迁移至config配置
+    color_score = max(
+        0.0,
+        100.0 - abs(mean_saturation - 0.4) / 0.4 * 100
+    )
+    return mean_saturation, float(color_score)
+
+def calculate_aesthetic(image_path):
+    try:
+        model = load_nima_model()
+        with torch.no_grad():
+            output = model(str(image_path))
+        nima_raw = float(output.item())
+        if not np.isfinite(nima_raw):
+            raise ValueError("NIMA输出不是有效数值")
+        aesthetic_score = (
+            (nima_raw - 1.0) / 9.0 * 100.0
+        )
+        aesthetic_score = float(
+            np.clip(aesthetic_score, 0, 100)
+        )
+        return nima_raw, aesthetic_score
+    except Exception as e:
+        print(f"NIMA评价失败：{image_path}，原因：{e}")
+        return None, None
+
+def calculate_composition(
+    subject_coverage=None,
+    saliency_retention=None
+):
+    """
+    subject_coverage：主体在候选图像中的保留比例，范围0-1。允许传入0合法值
+    saliency_retention：显著性信息保留比例，范围0-1。允许传入0合法值
+    两项均缺失时，不计算构图分数返回None。
+    当前采用两项等权融合；只有一项可用时使用该项。
+    """
+    values = []
+    if subject_coverage is not None:
+        if not 0 <= subject_coverage <= 1:
+            raise ValueError("subject_coverage必须在0到1之间")
+        values.append(float(subject_coverage))
+    if saliency_retention is not None:
+        if not 0 <= saliency_retention <= 1:
+            raise ValueError("saliency_retention必须在0到1之间")
+        values.append(float(saliency_retention))
+    if not values:
+        return None, None
+    raw = {
+        "subject_coverage": subject_coverage,
+        "saliency_retention": saliency_retention
+    }
+    composition_score = float(np.mean(values) * 100)
+    return raw, composition_score
+
+def calculate_total_score(scores, weight_cfg=None):
+    if weight_cfg is None:
+        weight_cfg = WEIGHTS
+    if set(weight_cfg) != set(WEIGHTS):
+        raise ValueError("评分权重必须包含五个维度")
+    weights = {}
+    for key, value in weight_cfg.items():
+        if isinstance(value, bool):
+            raise ValueError(f"{key}权重类型错误")
+        value = float(value)
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"{key}权重必须是有限非负数")
+        weights[key] = value
+    if not np.isclose(sum(weights.values()), 1.0, atol=1e-6):
+        raise ValueError("五维初始权重之和必须为1")
+    available = {
+        key: float(value)
+        for key, value in scores.items()
+        if value is not None and weights[key] > 0
+    }
+    for value in available.values():
+        if not np.isfinite(value) or not 0 <= value <= 100:
+            raise ValueError("评分必须是0到100之间的有限数值")
+    if not available:
+        return None, {key: 0.0 for key in WEIGHTS}
+    weight_sum = sum(weights[key] for key in available)
+    effective_weights = {
+        key: (
+            weights[key] / weight_sum
+            if key in available else 0.0
+        )
+        for key in WEIGHTS
+    }
+    total_score = sum(
+        available[key] * effective_weights[key]
+        for key in available
+    )
+    return float(total_score), effective_weights
+
+def score_candidate(candidate, config):
+    required_fields = [
+        "group_id",
+        "image_id",
+        "image_path",
+        "crop_id",
+        "box",
+        "image_width",
+        "image_height",
+        "crop_path",
+        "is_original",
+        "subject_coverage",
+        "saliency_retention"
+    ]
+    if not isinstance(candidate, dict):
+        return make_result(
+            "error",
+            "候选图像信息格式错误",
+            errors=[make_error("INVALID_INPUT", "candidate必须是字典")]
+        )
+    missing = [
+        key for key in required_fields
+        if key not in candidate
+    ]
+    if missing:
+        return make_result(
+            "error",
+            "候选图像缺少必要字段",
+            errors=[make_error(
+                "INVALID_INPUT",
+                f"缺少字段：{missing}"
+            )]
+        )
+    if not isinstance(config, dict):
+        return make_result(
+            "error",
+            "评分配置格式错误",
+            errors=[make_error("INVALID_CONFIG", "config必须是字典")]
+        )
+    score_config = config.get("score", config)
+    weights = score_config.get("weights", WEIGHTS)
+    normalization_id = score_config.get(
+        "normalization_id", NORMALIZATION_ID
+    )
+    scoring_profile_id = score_config.get(
+        "scoring_profile_id", SCORING_PROFILE_ID
+    )
+    if (
+        normalization_id == "pending"
+        or scoring_profile_id == "pending"
+        or not normalization_id
+        or not scoring_profile_id
+    ):
+        return make_result(
+            "error",
+            "评分配置尚未完成",
+            errors=[make_error(
+                "INVALID_CONFIG",
+                "normalization_id和scoring_profile_id不能为pending"
+            )]
+        )
+    try:
+        if set(weights) != set(WEIGHTS):
+            raise ValueError("必须提供五个维度的权重")
+        weight_values = {
+            key: float(value)
+            for key, value in weights.items()
+        }
+        if any(
+            not np.isfinite(v) or v < 0
+            for v in weight_values.values()
+        ):
+            raise ValueError("权重必须为有限非负数")
+        if not np.isclose(
+            sum(weight_values.values()), 1.0, atol=1e-6
+        ):
+            raise ValueError("五维权重之和必须为1")
+    except (TypeError, ValueError) as e:
+        return make_result(
+            "error",
+            "评分权重配置错误",
+            errors=[make_error("INVALID_CONFIG", str(e))]
+        )
+    image_path = PROJECT_ROOT / candidate["crop_path"]
+    if not image_path.is_file():
+        return make_result(
+            "error",
+            "候选图像文件不存在",
+            errors=[make_error(
+                "IMAGE_NOT_FOUND",
+                str(candidate["crop_path"])
+            )]
+        )
+    suffix = image_path.suffix.lower()
+    if suffix not in [".jpg", ".jpeg", ".png"]:
+        return make_result(
+            "error",
+            "不支持的图像格式",
+            errors=[make_error(
+                "UNSUPPORTED_FORMAT",
+                suffix
+            )]
+        )
+    image = cv2.imdecode(
+        np.fromfile(str(image_path), dtype=np.uint8),
+        cv2.IMREAD_COLOR
+    )
+    if image is None:
+        return make_result(
+            "error",
+            "图像解码失败",
+            errors=[make_error(
+                "IMAGE_DECODE_FAILED",
+                str(candidate["crop_path"])
+            )]
+        )
+    height, width = image.shape[:2]
+    if width <= 0 or height <= 0:
+        return make_result(
+            "error",
+            "图像尺寸无效",
+            errors=[make_error(
+                "INVALID_IMAGE_SIZE",
+                "图像宽高必须大于0"
+            )]
+        )
+    start_time = time.perf_counter()
+    raw_scores = {
+        "sharpness": None,
+        "exposure": None,
+        "color": None,
+        "aesthetic": None,
+        "composition": None
+    }
+    scores = {
+        "sharpness": None,
+        "exposure": None,
+        "color": None,
+        "aesthetic": None,
+        "composition": None
+    }
+    errors = []
+    def run_metric(name, function):
+        try:
+            raw, score = function()
+            if score is not None:
+                score = float(score)
+                if not np.isfinite(score) or not 0 <= score <= 100:
+                    raise ValueError("指标得分超出有效范围")
+                scores[name] = score
+                raw_scores[name] = raw
+        except Exception as e:
+            errors.append(make_error(
+                "INFERENCE_FAILED",
+                f"{name}评分失败：{str(e)}",
+                {
+                    "group_id": candidate["group_id"],
+                    "image_id": candidate["image_id"],
+                    "crop_id": candidate["crop_id"],
+                    "dimension": name
+                }
+            ))
+    run_metric(
+        "sharpness",
+        lambda: calculate_sharpness(image)
+    )
+    run_metric(
+        "exposure",
+        lambda: calculate_exposure(image)
+    )
+    run_metric(
+        "color",
+        lambda: calculate_color(image)
+    )
+    run_metric(
+        "aesthetic",
+        lambda: calculate_aesthetic(image_path)
+    )
+    run_metric(
+        "composition",
+        lambda: calculate_composition(
+            candidate["subject_coverage"],
+            candidate["saliency_retention"]
+        )
+    )
+    try:
+        total_score, effective_weights = calculate_total_score(
+            scores,
+            weight_values
+        )
+    except ValueError as e:
+        return make_result(
+            "error",
+            "综合评分计算失败",
+            errors=[make_error("INVALID_CONFIG", str(e))]
+        )
+    if total_score is None:
+        return make_result(
+            "error",
+            "没有可用的评分维度",
+            errors=errors or [
+                make_error("INFERENCE_FAILED", "所有评分维度均不可用")
+            ]
+        )
+    elapsed_time = time.perf_counter() - start_time
+    complete = all(
+        scores[key] is not None
+        for key in WEIGHTS
+    )
+    data = dict(candidate)
+    data.update({
+        "raw_scores": raw_scores,
+        "sharpness_score": scores["sharpness"],
+        "exposure_score": scores["exposure"],
+        "color_score": scores["color"],
+        "aesthetic_score": scores["aesthetic"],
+        "composition_score": scores["composition"],
+        "effective_weights": effective_weights,
+        "total_score": total_score,
+        "score_status": "ok" if complete else "partial",
+        "normalization_id": normalization_id,
+        "scoring_profile_id": scoring_profile_id,
+        "infer_time_s": elapsed_time
+    })
+    return make_result(
+        "ok" if complete else "partial",
+        "五维评分完成" if complete else "部分评分维度不可用，已重新分配权重",
+        data=data,
+        errors=errors
+    )
+
+def score_image(
+    image_path,
+    image_id="test_image",
+    composition_info=None,
+    weight_cfg=None
+):
+    """
+    个人测试用接口。
+    image_path使用项目根目录相对路径。
+    composition_info可传入主体覆盖率和显著性保留率。
+    """
+    composition_info = composition_info or {}
+    candidate = {
+        "group_id": "test_group",
+        "image_id": image_id,
+        "image_path": image_path,
+        "crop_id": 0,
+        "box": [0, 0, 1, 1],
+        "image_width": 1,
+        "image_height": 1,
+        "crop_path": image_path,
+        "is_original": True,
+        "subject_coverage": composition_info.get(
+            "subject_coverage"
+        ),
+        "saliency_retention": composition_info.get(
+            "saliency_retention"
+        )
+    }
+    config = {
+        "score": {
+            "weights": weight_cfg or WEIGHTS,
+            "normalization_id": NORMALIZATION_ID,
+            "scoring_profile_id": SCORING_PROFILE_ID
+        }
+    }
+    return score_candidate(candidate, config)
+
+def batch_score(candidates, config):
+    results = []
+    for index, candidate in enumerate(candidates):
+        print(
+            f"正在评分：{index + 1}/{len(candidates)}"
+        )
+        result = score_candidate(candidate, config)
+        results.append(result)
+    return results
