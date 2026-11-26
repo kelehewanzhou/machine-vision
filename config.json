@@ -1,0 +1,19 @@
+{
+    "score": {
+        "weights": {
+            "sharpness": 0.25,
+            "exposure": 0.20,
+            "color": 0.15,
+            "aesthetic": 0.20,
+            "composition": 0.20
+        },
+        "nima_model": "nima",
+        "normalization_id": "score_norm_v1",
+        "scoring_profile_id": "five_dim_score_v1"
+    },
+    "test": {
+        "ground_truth_filename": "GT.jpg",
+        "candidate_extension": ".png",
+        "phash_threshold": 8
+    }
+}
